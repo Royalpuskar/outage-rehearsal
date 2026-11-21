@@ -1,12 +1,74 @@
-
-function obj(v){if(!v||typeof v!=='object'||Array.isArray(v))throw Error('Expected an object');return v;}
-function arr(v,label='array'){if(!Array.isArray(v)||v.length>500)throw Error(label+' must be an array with at most 500 items');return v;}
-function str(v){if(typeof v!=='string'||!v.trim()||v.length>100000)throw Error('Expected nonempty text (max 100000 characters)');return v;}
-function num(v,label='number',min=-1e12){if(typeof v!=='number'||!Number.isFinite(v)||v<min||Math.abs(v)>1e12)throw Error(label+' must be a finite number in range');return v;}
-function bool(v){if(typeof v!=='boolean')throw Error('Expected a boolean');return v;}
-function date(v){if(typeof v!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(v))throw Error('Expected YYYY-MM-DD');const t=Date.parse(v+'T00:00:00Z');if(!Number.isFinite(t)||new Date(t).toISOString().slice(0,10)!==v)throw Error('Invalid calendar date');return t;}
-export function run(x){obj(x);if(JSON.stringify(x).length>200000)throw Error('Input exceeds 200 KB limit');
-
-num(x.threshold,'threshold',1);num(x.cooldown,'cooldown',0);if(!Number.isInteger(x.threshold))throw Error('Threshold must be integer');let failures=0,until=-Infinity,prev=-Infinity;const rows=arr(x.events,'events').map(e=>{num(e.at,'time');bool(e.ok);if(e.at<prev)throw Error('Events out of order');prev=e.at;if(e.at<until)return {at:e.at,result:'blocked',state:'open'};if(e.ok){failures=0;until=-Infinity;return {at:e.at,result:'success',state:'closed'};}failures++;if(failures>=x.threshold)until=e.at+x.cooldown;return {at:e.at,result:'failure',state:failures>=x.threshold?'open':'closed'};});return {metrics:{events:rows.length,blocked:rows.filter(r=>r.result==='blocked').length},rows};
-
+// Deterministic, sequential circuit-breaker model. No network requests are made.
+function object(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Expected an object');
+  return value;
+}
+function number(value, label, min = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > 1e12)
+    throw Error(label + ' must be finite and in range');
+  return value;
+}
+function count(value, label) {
+  number(value, label, 1);
+  if (!Number.isInteger(value)) throw Error(label + ' must be an integer');
+  return value;
+}
+export function run(input) {
+  object(input);
+  if (JSON.stringify(input).length > 200000) throw Error('Input exceeds 200000 serialized characters');
+  const threshold = count(input.threshold, 'threshold');
+  const cooldown = number(input.cooldown, 'cooldown');
+  const recoverySuccesses = count(input.recoverySuccesses === undefined ? 1 : input.recoverySuccesses, 'recoverySuccesses');
+  if (!Array.isArray(input.events) || input.events.length > 500) throw Error('events must be an array of at most 500 items');
+  let previous = -Infinity;
+  // Validate the entire event log before replaying it.
+  const events = Array.from(input.events, event => {
+    object(event);
+    const at = number(event.at, 'time', -1e12);
+    if (typeof event.ok !== 'boolean') throw Error('Event ok must be a boolean');
+    if (at < previous) throw Error('Events out of order');
+    previous = at;
+    return {at, ok: event.ok};
+  });
+  let state = 'closed', failures = 0, successes = 0, retryAt = null;
+  let opened = 0, recovered = 0, probes = 0;
+  const rows = events.map(({at, ok}, eventIndex) => {
+    const before = state;
+    let admittedState = state, result, reason;
+    if (state === 'open' && at < retryAt) {
+      result = 'blocked'; reason = 'cooldown-active';
+    } else {
+      if (state === 'open') {state = 'half-open'; successes = 0; retryAt = null;}
+      admittedState = state;
+      result = ok ? 'success' : 'failure';
+      if (state === 'half-open') {
+        probes++;
+        if (!ok) {
+          state = 'open'; retryAt = at + cooldown; successes = 0;
+          opened++; reason = 'probe-failed';
+        } else {
+          successes++;
+          if (successes >= recoverySuccesses) {
+            state = 'closed'; failures = 0; successes = 0;
+            recovered++; reason = 'recovery-confirmed';
+          } else reason = 'recovery-pending';
+        }
+      } else if (ok) {
+        failures = 0; reason = 'request-succeeded';
+      } else {
+        failures++;
+        if (failures >= threshold) {
+          state = 'open'; retryAt = at + cooldown; opened++; reason = 'failure-threshold';
+        } else reason = 'failure-below-threshold';
+      }
+    }
+    return {eventIndex, at, result, before, admittedState, state, reason,
+      failures, recoveryProgress: successes, retryAt};
+  });
+  return {
+    metrics: {events: rows.length, blocked: rows.filter(row => row.result === 'blocked').length,
+      probes, opened, recovered},
+    rows,
+    final: {state, failures, recoveryProgress: successes, retryAt}
+  };
 }
